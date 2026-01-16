@@ -1,0 +1,28 @@
+services:
+  pdf-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    profiles:
+      - prod
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    env_file:
+      - .env
+    depends_on:
+      - pdf-api
+
+volumes:
+  caddy_data:
+  caddy_config:

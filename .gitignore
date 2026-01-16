@@ -1,0 +1,30 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+api/__pycache__/
+api/.pytest_cache/
+
+# Node
+node_modules/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Git
+.git/
+
+# Docker / volumes
+caddy_data/
+caddy_config/
+
+# Outputs
+*.pdf

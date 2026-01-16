@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HTML a PDF</title>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 24px; }
+      h1 { margin: 0 0 12px; }
+      .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; }
+      .muted { color: #6b7280; }
+      table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+      th, td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; }
+    </style>
+  </head>
+  <body>
+    <h1>Reporte</h1>
+    <div class="card">
+      <div class="muted">Generado desde HTML con Puppeteer</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th>Valor</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Fecha</td>
+            <td>{{date}}</td>
+          </tr>
+          <tr>
+            <td>Usuario</td>
+            <td>{{user}}</td>
+          </tr>
+          <tr>
+            <td>Total</td>
+            <td>{{total}}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </body>
+</html>

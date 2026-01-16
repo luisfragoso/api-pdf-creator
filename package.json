@@ -1,0 +1,16 @@
+{
+  "name": "api-pdf-creator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "generate:jspdf": "node examples/generate-jspdf.js",
+    "generate:pdfkit": "node examples/generate-pdfkit.js",
+    "generate:html": "node examples/generate-html.js"
+  },
+  "dependencies": {
+    "jspdf": "^2.5.1",
+    "pdfkit": "^0.15.0",
+    "puppeteer": "^21.6.1"
+  }
+}

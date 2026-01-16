@@ -1,0 +1,31 @@
+{
+	# Email usado por Let's Encrypt (ACME)
+	email {$ACME_EMAIL}
+
+	# Recomendado para producción
+	# (Caddy maneja los certificados automáticamente)
+}
+
+{$DOMAIN} {
+	encode gzip zstd
+
+	# Limita tamaño del body (HTML grande) antes de llegar a la app
+	request_body {
+		max_size {$PROXY_MAX_BODY}
+	}
+
+	# Headers básicos
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# Proxy a la API interna
+	reverse_proxy pdf-api:8000 {
+		transport http {
+			read_timeout {$PROXY_READ_TIMEOUT}
+			write_timeout {$PROXY_WRITE_TIMEOUT}
+		}
+	}
+}
