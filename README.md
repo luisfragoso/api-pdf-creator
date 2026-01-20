@@ -60,7 +60,7 @@ La plantilla está en:
 
 ---
 
-# HTML to PDF API (Python/FastAPI + WeasyPrint)
+# HTML to PDF API (Python/FastAPI + Chromium/Playwright)
 
 Este repo también incluye una API en Python para convertir HTML → PDF.
 
@@ -82,6 +82,7 @@ docker compose up --build
 Esto levanta la API en:
 
 - `http://localhost:8000/health`
+- `http://localhost:8000/health/deep`
 - `http://localhost:8000/docs`
 
 ## Deploy en producción (subdominio + HTTPS)
@@ -124,11 +125,13 @@ docker compose --profile prod up -d --build
 - La API devuelve `X-Request-Id` en todas las respuestas.
 - Puedes enviar tu propio `X-Request-Id` en el request.
 - Endpoint de versión/config: `GET /version`
+- Health check profundo (verifica que Chromium puede arrancar): `GET /health/deep`
 
 ## Límites y timeouts
 
 - Tamaño máximo de HTML (app): `MAX_HTML_BYTES`
 - Timeout de render (app): `RENDER_TIMEOUT_SECONDS`
+- Backpressure: `MAX_RENDER_QUEUE` (limita cuántos renders se quedan esperando además de `WORKERS`)
 - Rate limit por token (req/min):
   - `RATE_LIMIT_NORMAL_PER_MIN`
   - `RATE_LIMIT_REMOTE_PER_MIN`
@@ -141,6 +144,12 @@ Variables útiles:
 
 - `PDF_VIEWPORT_WIDTH` / `PDF_VIEWPORT_HEIGHT`: viewport usado para renderizar (impacta layout responsive).
 - `PDF_OUTPUT_WIDTH` / `PDF_OUTPUT_HEIGHT`: tamaño de salida del PDF en px. Si `PDF_OUTPUT_HEIGHT` está vacío, se usa el alto real del documento (scrollHeight) para evitar paginación.
+
+Opcionales (performance/estabilidad):
+
+- `CHROMIUM_PERSISTENT=1`: reutiliza Chromium entre requests.
+- `CHROMIUM_RESTART_AFTER=N`: reinicia Chromium cada N renders (si `CHROMIUM_PERSISTENT=1`).
+- `FORCE_EXACT_COLORS=1`: inyecta `print-color-adjust: exact` para colores más consistentes.
 
 ## Autenticación (tokens)
 
@@ -162,11 +171,29 @@ Recibe JSON:
 
 ```json
 { "html": "<html>...</html>", "filename": "reporte.pdf", "base_url": null }
+
+Opcionales (para HTML dinámico o control fino):
+
+- `wait_delay_ms`: espera fija antes de imprimir.
+- `wait_for_selector`: espera a que un selector sea visible.
+- `wait_for_expression`: espera a que una expresión JS sea true.
+- `wait_window_status`: espera a que `window.status` sea un valor.
+- `wait_networkidle`: espera adicional a `networkidle`.
+- `strict_resources`: si es true, falla si algún recurso falla o devuelve HTTP >= 400.
+- `force_exact_colors`: inyecta `print-color-adjust: exact`.
+- `user_agent`: sobrescribe User-Agent.
+- `extra_http_headers`: diccionario JSON de headers extra.
 ```
 
 ### `POST /pdf/raw`
 
 Recibe HTML crudo (`text/html`) y responde PDF.
+
+Soporta query params opcionales:
+
+- `wait_delay_ms`, `wait_for_selector`, `wait_for_expression`, `wait_window_status`, `wait_networkidle`
+- `strict_resources`, `force_exact_colors`, `user_agent`
+- `extra_http_headers_json` (JSON string con headers)
 
 ### `POST /pdf/upload`
 
@@ -176,6 +203,10 @@ Recibe `multipart/form-data`:
 - Campo(s) `files` (imágenes, etc.)
 
 En el HTML usa rutas relativas, por ejemplo: `<img src="logo.png">`.
+
+Opcionales (query):
+
+- `strict_resources`, `force_exact_colors`, `user_agent`
 
 ### `POST /jobs`
 
@@ -212,7 +243,7 @@ Descarga el PDF cuando el job está en `done`.
 $html = Get-Content -Raw -Encoding UTF8 ".\Reporte Natura.html"
 
 Invoke-WebRequest `
-  -Uri "http://localhost:8000/pdf/raw?filename=Reporte%20Natura.pdf" `
+  -Uri "http://localhost:8000/pdf/raw?filename=Reporte%20Natura.pdf&media=screen&strict_resources=true&force_exact_colors=true" `
   -Headers @{ Authorization = "Bearer client-token-2" } `
   -Method Post `
   -ContentType "text/html; charset=utf-8" `
