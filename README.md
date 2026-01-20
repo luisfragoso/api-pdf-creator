@@ -158,6 +158,11 @@ Los devs NO deben hardcodear tokens en el código. Se configuran por ambiente en
 - `PDF_API_KEYS`: tokens normales (no permiten recursos remotos)
 - `PDF_REMOTE_API_KEYS`: tokens con permiso a recursos remotos (solo HTTPS + allowlist)
 
+Notas:
+
+- Si generas un PDF con un token normal y tu HTML incluye imágenes/fonts remotas, esos recursos se bloquearán (verás placeholders).
+- Para HTMLs que consumen recursos remotos (fonts, CDN, imágenes por URL), usa un token remoto.
+
 En requests puedes autenticar con:
 
 - Header `Authorization: Bearer <token>`
@@ -239,6 +244,8 @@ Descarga el PDF cuando el job está en `done`.
 
 ## Ejemplo (PowerShell)
 
+Si ves caracteres raros tipo `Ã¡`, `Ã³`, etc., es un problema de encoding del request. Asegúrate de leer el archivo con `-Encoding UTF8`.
+
 ```powershell
 $html = Get-Content -Raw -Encoding UTF8 ".\Reporte Natura.html"
 
@@ -275,3 +282,22 @@ Los recursos remotos (CSS/imagenes por URL) están controlados por:
 - Token con permiso (`PDF_REMOTE_API_KEYS`)
 - Solo HTTPS
 - Allowlist de hosts: `ALLOWED_REMOTE_HOSTS`
+
+Hardening adicional:
+
+- Bloqueo de redirects hacia hosts no permitidos.
+- `extra_http_headers` se sanitiza y por defecto solo está permitido para tokens remotos.
+- `file://` está bloqueado por defecto. Solo se permite en `/pdf/upload` y solo dentro del directorio temporal del upload.
+
+Variables:
+
+- `ALLOW_ANONYMOUS`: si es 1, permite requests sin tokens (NO recomendado).
+- `ALLOW_FILE_SCHEME`: si es 1, habilita `file://` solo para `/pdf/upload` (con root restringido).
+- `EXTRA_HEADERS_REMOTE_ONLY`: si es 1, solo tokens remotos pueden usar `extra_http_headers`.
+- `BLOCKED_EXTRA_HEADERS`, `MAX_EXTRA_HEADERS`, `MAX_HEADER_VALUE_LEN`: filtros/límites para `extra_http_headers`.
+
+## Tamaño de página (según HTML)
+
+Si el HTML define tamaño de hoja con CSS (por ejemplo `@page { size: A4; }`), la API usa automáticamente modo `print` para respetar ese tamaño.
+
+Si quieres forzar el layout de pantalla, envía `media=screen` explícitamente en el request o evita definir `@page size:` en tu HTML.
