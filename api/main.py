@@ -11,6 +11,9 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.parse import unquote
+from urllib.parse import urljoin
+from pathlib import PurePosixPath
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -51,6 +54,13 @@ RATE_LIMIT_REMOTE_PER_MIN = int(os.getenv("RATE_LIMIT_REMOTE_PER_MIN", "20"))
 
 JOBS_TTL_SECONDS = int(os.getenv("JOBS_TTL_SECONDS", "900"))
 
+ALLOW_ANONYMOUS = os.getenv("ALLOW_ANONYMOUS", "").strip().lower() in {"1", "true", "yes"}
+ALLOW_FILE_SCHEME = os.getenv("ALLOW_FILE_SCHEME", "").strip().lower() in {"1", "true", "yes"}
+EXTRA_HEADERS_REMOTE_ONLY = os.getenv("EXTRA_HEADERS_REMOTE_ONLY", "1").strip().lower() in {"1", "true", "yes"}
+BLOCKED_EXTRA_HEADERS = os.getenv("BLOCKED_EXTRA_HEADERS", "authorization,cookie,proxy-authorization").strip()
+MAX_EXTRA_HEADERS = int(os.getenv("MAX_EXTRA_HEADERS", "20"))
+MAX_HEADER_VALUE_LEN = int(os.getenv("MAX_HEADER_VALUE_LEN", "1024"))
+
 
 def _parse_csv_set(value: str) -> set[str]:
     if not value:
@@ -71,6 +81,7 @@ FORCE_EXACT_COLORS = os.getenv("FORCE_EXACT_COLORS", "").strip().lower() in {"1"
 _ALLOWED_REMOTE_URL_RE = re.compile(ALLOWED_REMOTE_URL_REGEX, re.IGNORECASE) if ALLOWED_REMOTE_URL_REGEX else None
 _DENIED_REMOTE_URL_RE = re.compile(DENIED_REMOTE_URL_REGEX, re.IGNORECASE) if DENIED_REMOTE_URL_REGEX else None
 _RESOURCE_STATUS_IGNORE_DOMAINS = {h.lower() for h in _parse_csv_set(RESOURCE_STATUS_IGNORE_DOMAINS)}
+_BLOCKED_EXTRA_HEADERS = {h.lower() for h in _parse_csv_set(BLOCKED_EXTRA_HEADERS)}
 
 
 class _AuthContext(BaseModel):
@@ -234,7 +245,9 @@ def _require_api_key(
     x_api_key: str | None = Depends(_api_key_scheme),
 ):
     if not API_KEYS and not REMOTE_API_KEYS:
-        return _AuthContext(token="", allow_remote=False)
+        if ALLOW_ANONYMOUS:
+            return _AuthContext(token="", allow_remote=False)
+        raise HTTPException(status_code=500, detail="API keys no configuradas")
 
     token = bearer.credentials.strip() if bearer and bearer.credentials else None
 
@@ -327,6 +340,77 @@ def _assert_remote_url_allowed(url: str, allow_remote: bool) -> None:
             raise HTTPException(status_code=400, detail="Host remoto no permitido")
 
 
+def _is_path_within_root(path: str, root: str) -> bool:
+    try:
+        p = os.path.realpath(path)
+        r = os.path.realpath(root)
+    except Exception:
+        return False
+
+    try:
+        common = os.path.commonpath([p, r])
+    except Exception:
+        return False
+    return common == r
+
+
+def _validate_base_url(
+    base_url: str | None,
+    *,
+    allow_remote: bool,
+    allow_file_access: bool,
+    file_root: str | None,
+) -> None:
+    if not base_url:
+        return
+    parsed = urlparse(base_url)
+
+    if parsed.scheme == "file":
+        if not allow_file_access:
+            raise HTTPException(status_code=400, detail="base_url file:// no permitido")
+        if not ALLOW_FILE_SCHEME:
+            raise HTTPException(status_code=400, detail="base_url file:// no permitido")
+        if not file_root:
+            raise HTTPException(status_code=400, detail="base_url file:// no permitido")
+        file_path = unquote(parsed.path or "")
+        if not file_path:
+            raise HTTPException(status_code=400, detail="base_url inválido")
+        if not _is_path_within_root(file_path, file_root):
+            raise HTTPException(status_code=400, detail="base_url file:// fuera de directorio permitido")
+        return
+
+    if parsed.scheme in {"http", "https"}:
+        _assert_remote_url_allowed(base_url, allow_remote=allow_remote)
+        return
+
+    if parsed.scheme:
+        raise HTTPException(status_code=400, detail="base_url inválido")
+
+
+def _sanitize_extra_http_headers(headers: dict[str, str] | None, allow_remote: bool) -> dict[str, str] | None:
+    if not headers:
+        return None
+    if EXTRA_HEADERS_REMOTE_ONLY and not allow_remote:
+        raise HTTPException(status_code=400, detail="extra_http_headers no permitido")
+
+    if len(headers) > MAX_EXTRA_HEADERS:
+        raise HTTPException(status_code=400, detail="Demasiados headers extra")
+
+    sanitized: dict[str, str] = {}
+    for k, v in headers.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        key_lower = key.lower()
+        if key_lower in _BLOCKED_EXTRA_HEADERS:
+            raise HTTPException(status_code=400, detail=f"Header no permitido: {key}")
+        value = str(v)
+        if len(value) > MAX_HEADER_VALUE_LEN:
+            raise HTTPException(status_code=400, detail=f"Header demasiado largo: {key}")
+        sanitized[key] = value
+    return sanitized or None
+
+
 def _normalize_html_input(html: str) -> str:
     if not html:
         return html
@@ -340,6 +424,16 @@ def _normalize_html_input(html: str) -> str:
         )
 
     return normalized
+
+
+def _html_defines_page_size(html: str) -> bool:
+    if not html:
+        return False
+    lowered = html.lower()
+    lowered = re.sub(r"/\*[\s\S]*?\*/", "", lowered)
+    if "@page" not in lowered:
+        return False
+    return bool(re.search(r"@page\b[\s\S]{0,2000}\bsize\s*:", lowered))
 
 
 def _inject_base_href(html: str, base_url: str | None) -> str:
@@ -380,9 +474,13 @@ def _render_pdf_chromium(
     user_agent: str | None,
     extra_http_headers: dict[str, str] | None,
     force_exact_colors: bool,
+    allow_file_access: bool,
+    file_root: str | None,
 ) -> bytes:
     normalized_html = _inject_base_href(html, base_url)
     t0 = time.perf_counter()
+
+    blocked_urls: list[dict[str, object]] = []
 
     _logger.info(
         json.dumps(
@@ -413,6 +511,8 @@ def _render_pdf_chromium(
         user_agent: str | None,
         extra_http_headers: dict[str, str] | None,
         force_exact_colors: bool,
+        allow_file_access: bool,
+        file_root: str | None,
         route_handler,
         t0: float,
     ) -> bytes:
@@ -441,6 +541,18 @@ def _render_pdf_chromium(
 
             resource_failures: list[dict[str, str | None]] = []
             resource_bad_status: list[dict[str, object]] = []
+
+            def _failure_text(req) -> str | None:
+                try:
+                    f = req.failure
+                except Exception:
+                    return None
+                if f is None:
+                    return None
+                if isinstance(f, dict):
+                    return str(f.get("errorText") or f.get("error"))
+                return str(f)
+
             page.on(
                 "requestfailed",
                 lambda req: _logger.info(
@@ -450,7 +562,7 @@ def _render_pdf_chromium(
                             "media": media,
                             "allow_remote": allow_remote,
                             "url": req.url,
-                            "failure": (req.failure or {}).get("errorText"),
+                            "failure": _failure_text(req),
                         }
                     )
                 ),
@@ -460,28 +572,76 @@ def _render_pdf_chromium(
                 lambda req: resource_failures.append(
                     {
                         "url": req.url,
-                        "failure": (req.failure or {}).get("errorText"),
+                        "failure": _failure_text(req),
                     }
                 ),
             )
-            page.on(
-                "response",
-                lambda resp: resource_bad_status.append(
-                    {
-                        "url": resp.url,
-                        "status": resp.status,
-                    }
-                )
-                if (
-                    strict_resources
-                    and resp.status >= 400
-                    and (
-                        not _RESOURCE_STATUS_IGNORE_DOMAINS
-                        or (urlparse(resp.url).hostname or "").lower() not in _RESOURCE_STATUS_IGNORE_DOMAINS
-                    )
-                )
-                else None,
-            )
+            def _on_response(resp):
+                try:
+                    if (
+                        strict_resources
+                        and resp.status >= 400
+                        and (
+                            not _RESOURCE_STATUS_IGNORE_DOMAINS
+                            or (urlparse(resp.url).hostname or "").lower() not in _RESOURCE_STATUS_IGNORE_DOMAINS
+                        )
+                    ):
+                        resource_bad_status.append(
+                            {
+                                "url": resp.url,
+                                "status": resp.status,
+                            }
+                        )
+
+                    if 300 <= resp.status < 400:
+                        location = None
+                        try:
+                            location = (resp.headers or {}).get("location")
+                        except Exception:
+                            location = None
+                        if location:
+                            target = urljoin(resp.url, location)
+                            t_parsed = urlparse(target)
+
+                            if t_parsed.scheme in {"http", "https"}:
+                                try:
+                                    _assert_remote_url_allowed(target, allow_remote=allow_remote)
+                                except HTTPException:
+                                    blocked_urls.append(
+                                        {
+                                            "url": target,
+                                            "reason": "redirect_target_not_allowed",
+                                            "from": resp.url,
+                                        }
+                                    )
+                            elif t_parsed.scheme == "file":
+                                file_path = unquote(t_parsed.path or "")
+                                if (
+                                    not allow_file_access
+                                    or not ALLOW_FILE_SCHEME
+                                    or not file_root
+                                    or not file_path
+                                    or not _is_path_within_root(file_path, file_root)
+                                ):
+                                    blocked_urls.append(
+                                        {
+                                            "url": target,
+                                            "reason": "redirect_target_not_allowed",
+                                            "from": resp.url,
+                                        }
+                                    )
+                            elif t_parsed.scheme:
+                                blocked_urls.append(
+                                    {
+                                        "url": target,
+                                        "reason": "redirect_target_not_allowed",
+                                        "from": resp.url,
+                                    }
+                                )
+                except Exception:
+                    return
+
+            page.on("response", _on_response)
 
             if media in {"screen", "print"}:
                 page.emulate_media(media=media)
@@ -580,6 +740,13 @@ def _render_pdf_chromium(
                     detail=f"Recursos con HTTP status inválido: {resource_bad_status[:5]}",
                 )
 
+            blocked_nav = [b for b in blocked_urls if b.get("is_navigation") or "from" in b]
+            if blocked_nav:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Navegación/redirect bloqueado: {blocked_nav[:5]}",
+                )
+
             page.wait_for_timeout(100)
 
             t_ready = time.perf_counter()
@@ -670,6 +837,20 @@ def _render_pdf_chromium(
         url = request.url
         parsed = urlparse(url)
 
+        def _block(reason: str):
+            try:
+                blocked_urls.append(
+                    {
+                        "url": url,
+                        "reason": reason,
+                        "is_navigation": bool(getattr(request, "is_navigation_request", lambda: False)()),
+                        "resource_type": getattr(request, "resource_type", None),
+                    }
+                )
+            except Exception:
+                pass
+            route.abort()
+
         if parsed.scheme in {"http", "https"}:
             try:
                 _assert_remote_url_allowed(url, allow_remote=allow_remote)
@@ -684,16 +865,30 @@ def _render_pdf_chromium(
                         }
                     )
                 )
-                route.abort()
+                _block("remote_url_not_allowed")
                 return
             route.continue_()
             return
 
-        if parsed.scheme in {"file", "data", "blob", "about"}:
+        if parsed.scheme == "file":
+            if not allow_file_access or not ALLOW_FILE_SCHEME or not file_root:
+                _block("file_scheme_not_allowed")
+                return
+            file_path = unquote(parsed.path or "")
+            if not file_path:
+                _block("file_invalid_path")
+                return
+            if not _is_path_within_root(file_path, file_root):
+                _block("file_outside_root")
+                return
             route.continue_()
             return
 
-        route.abort()
+        if parsed.scheme in {"data", "blob", "about"}:
+            route.continue_()
+            return
+
+        _block("scheme_not_allowed")
 
     t_pw0 = time.perf_counter()
     _logger.info(
@@ -778,6 +973,8 @@ def _render_pdf_chromium(
                 user_agent=user_agent,
                 extra_http_headers=extra_http_headers,
                 force_exact_colors=force_exact_colors,
+                allow_file_access=allow_file_access,
+                file_root=file_root,
                 route_handler=_route_handler,
                 t0=t0,
             )
@@ -847,6 +1044,8 @@ def _render_pdf_chromium(
                         user_agent=user_agent,
                         extra_http_headers=extra_http_headers,
                         force_exact_colors=force_exact_colors,
+                        allow_file_access=allow_file_access,
+                        file_root=file_root,
                         route_handler=_route_handler,
                         t0=t0,
                     )
@@ -899,7 +1098,17 @@ def _render_pdf_with_timeout(
     user_agent: str | None,
     extra_http_headers: dict[str, str] | None,
     force_exact_colors: bool,
+    allow_file_access: bool,
+    file_root: str | None,
 ) -> bytes:
+    _validate_base_url(
+        base_url,
+        allow_remote=allow_remote,
+        allow_file_access=allow_file_access,
+        file_root=file_root,
+    )
+    extra_http_headers = _sanitize_extra_http_headers(extra_http_headers, allow_remote=allow_remote)
+
     acquired = _render_slots.acquire(blocking=False)
     if not acquired:
         raise HTTPException(status_code=503, detail="Cola de render saturada")
@@ -923,6 +1132,8 @@ def _render_pdf_with_timeout(
         user_agent=user_agent,
         extra_http_headers=extra_http_headers,
         force_exact_colors=force_exact_colors,
+        allow_file_access=allow_file_access,
+        file_root=file_root,
     )
 
     def _release(_: Future[bytes]):
@@ -941,8 +1152,20 @@ def _render_pdf_with_timeout(
 class PdfRequest(BaseModel):
     html: str = Field(..., description="HTML completo a renderizar")
     filename: str | None = Field("documento.pdf", description="Nombre sugerido del PDF")
-    base_url: str | None = Field(None, description="Base URL para resolver rutas relativas (ej. file:///.../ o https://.../)")
-    media: str | None = Field(None, description="Media a emular: 'screen' (default) o 'print'")
+    base_url: str | None = Field(
+        None,
+        description=(
+            "Base URL para resolver rutas relativas. Soporta https:// (solo con token remoto + allowlist) y file:// "
+            "solo en /pdf/upload cuando ALLOW_FILE_SCHEME=1 (restringido al directorio temporal del upload)."
+        ),
+    )
+    media: str | None = Field(
+        None,
+        description=(
+            "Media a emular: 'screen' (default) o 'print'. Si no se envía y el HTML define '@page { size: ... }', "
+            "la API usa automáticamente 'print' para respetar el tamaño de hoja definido por CSS."
+        ),
+    )
 
     wait_delay_ms: int | None = Field(None, description="Espera fija (ms) antes de generar el PDF")
     wait_for_selector: str | None = Field(None, description="Selector CSS a esperar (visible) antes de generar el PDF")
@@ -952,7 +1175,13 @@ class PdfRequest(BaseModel):
 
     strict_resources: bool | None = Field(None, description="Si true, falla si algún recurso (IMG/CSS/JS) falla o devuelve HTTP >= 400")
     user_agent: str | None = Field(None, description="Sobrescribe el User-Agent")
-    extra_http_headers: dict[str, str] | None = Field(None, description="Headers extra por request (diccionario)")
+    extra_http_headers: dict[str, str] | None = Field(
+        None,
+        description=(
+            "Headers extra por request (diccionario). Por defecto solo permitido con token remoto y se filtran headers sensibles "
+            "(ej. Authorization/Cookie). También aplica límites de cantidad/tamaño."
+        ),
+    )
     force_exact_colors: bool | None = Field(None, description="Si true, inyecta print-color-adjust: exact para colores más consistentes")
 
 
@@ -1076,7 +1305,10 @@ def create_pdf(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
     html = _normalize_html_input(payload.html)
     _enforce_size_limit(html)
 
-    media = (payload.media or _default_media()).strip().lower()
+    if payload.media is None and _html_defines_page_size(html):
+        media = "print"
+    else:
+        media = (payload.media or _default_media()).strip().lower()
     if media not in {"print", "screen"}:
         raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
 
@@ -1106,6 +1338,8 @@ def create_pdf(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
             user_agent=user_agent,
             extra_http_headers=extra_http_headers,
             force_exact_colors=force_exact_colors,
+            allow_file_access=False,
+            file_root=None,
         )
         elapsed_ms = int((time.time() - started) * 1000)
         _logger.info(
@@ -1159,7 +1393,10 @@ def create_pdf_raw(
     normalized_html = _normalize_html_input(html)
     _enforce_size_limit(normalized_html)
 
-    media_normalized = (media or _default_media()).strip().lower()
+    if media is None and _html_defines_page_size(normalized_html):
+        media_normalized = "print"
+    else:
+        media_normalized = (media or _default_media()).strip().lower()
     if media_normalized not in {"print", "screen"}:
         raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
 
@@ -1191,6 +1428,8 @@ def create_pdf_raw(
             user_agent=(user_agent or "").strip() or None,
             extra_http_headers=extra_headers,
             force_exact_colors=force_exact_colors_val,
+            allow_file_access=False,
+            file_root=None,
         )
         elapsed_ms = int((time.time() - started) * 1000)
         _logger.info(
@@ -1222,7 +1461,10 @@ def create_job(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
     html = _normalize_html_input(payload.html)
     _enforce_size_limit(html)
 
-    media = (payload.media or _default_media()).strip().lower()
+    if payload.media is None and _html_defines_page_size(html):
+        media = "print"
+    else:
+        media = (payload.media or _default_media()).strip().lower()
     if media not in {"print", "screen"}:
         raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
 
@@ -1257,6 +1499,8 @@ def create_job(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
             user_agent=user_agent,
             extra_http_headers=extra_http_headers,
             force_exact_colors=force_exact_colors,
+            allow_file_access=False,
+            file_root=None,
         )
         return result
 
@@ -1319,7 +1563,10 @@ async def create_pdf_upload(
     normalized_html = _normalize_html_input(html)
     _enforce_size_limit(normalized_html)
 
-    media_normalized = (media or _default_media()).strip().lower()
+    if media is None and _html_defines_page_size(normalized_html):
+        media_normalized = "print"
+    else:
+        media_normalized = (media or _default_media()).strip().lower()
     if media_normalized not in {"print", "screen"}:
         raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
 
@@ -1355,6 +1602,8 @@ async def create_pdf_upload(
                 user_agent=(user_agent or "").strip() or None,
                 extra_http_headers=None,
                 force_exact_colors=force_exact_colors_val,
+                allow_file_access=True,
+                file_root=str(base_path),
             )
             elapsed_ms = int((time.time() - started) * 1000)
             _logger.info(
