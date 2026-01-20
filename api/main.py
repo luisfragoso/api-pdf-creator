@@ -1,9 +1,11 @@
 import os
+import asyncio
 import ipaddress
 import json
 import logging
 import socket
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -14,7 +16,11 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Re
 from fastapi.responses import Response
 from pydantic import BaseModel
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
-from weasyprint import HTML, default_url_fetcher
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:  # pragma: no cover
+    sync_playwright = None
 
 
 app = FastAPI(title="API PDF Creator")
@@ -24,8 +30,15 @@ PDF_API_KEYS = os.getenv("PDF_API_KEYS", "").strip()
 PDF_REMOTE_API_KEYS = os.getenv("PDF_REMOTE_API_KEYS", "").strip()
 ALLOWED_REMOTE_HOSTS = os.getenv("ALLOWED_REMOTE_HOSTS", "").strip()
 MAX_HTML_BYTES = int(os.getenv("MAX_HTML_BYTES", "2000000"))
-RENDER_TIMEOUT_SECONDS = float(os.getenv("RENDER_TIMEOUT_SECONDS", "30"))
+RENDER_TIMEOUT_SECONDS = float(os.getenv("RENDER_TIMEOUT_SECONDS", "90"))
 WORKERS = int(os.getenv("WORKERS", "2"))
+
+PDF_VIEWPORT_WIDTH = int(os.getenv("PDF_VIEWPORT_WIDTH", "1280"))
+PDF_VIEWPORT_HEIGHT = int(os.getenv("PDF_VIEWPORT_HEIGHT", "720"))
+PDF_OUTPUT_WIDTH = os.getenv("PDF_OUTPUT_WIDTH", "")
+PDF_OUTPUT_HEIGHT = os.getenv("PDF_OUTPUT_HEIGHT", "")
+PDF_MAX_HEIGHT_PX = int(os.getenv("PDF_MAX_HEIGHT_PX", "20000"))
+PDF_SCREEN_SINGLE_PAGE = os.getenv("PDF_SCREEN_SINGLE_PAGE", "").strip().lower() in {"1", "true", "yes"}
 
 RATE_LIMIT_NORMAL_PER_MIN = int(os.getenv("RATE_LIMIT_NORMAL_PER_MIN", "60"))
 RATE_LIMIT_REMOTE_PER_MIN = int(os.getenv("RATE_LIMIT_REMOTE_PER_MIN", "20"))
@@ -55,6 +68,36 @@ if not _logger.handlers:
 
 
 _executor = ThreadPoolExecutor(max_workers=max(1, WORKERS))
+
+_chromium_lock = threading.RLock()
+_playwright = None
+_chromium_browser = None
+
+
+def _get_chromium_browser():
+    global _playwright, _chromium_browser
+    if sync_playwright is None:
+        raise HTTPException(status_code=500, detail="Chromium no disponible (Playwright no instalado)")
+
+    if _chromium_browser is not None:
+        return _chromium_browser
+
+    with _chromium_lock:
+        if _chromium_browser is not None:
+            return _chromium_browser
+
+        _logger.info(json.dumps({"event": "chromium_init", "stage": "start_playwright"}))
+        _playwright = sync_playwright().start()
+        _logger.info(json.dumps({"event": "chromium_init", "stage": "launch"}))
+        _chromium_browser = _playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        _logger.info(json.dumps({"event": "chromium_init", "stage": "ready"}))
+        return _chromium_browser
 
 
 class _RateLimiter:
@@ -181,34 +224,34 @@ def _hostname_resolves_to_forbidden_ip(hostname: str) -> bool:
     return False
 
 
-def _safe_url_fetcher(url: str, allow_remote: bool):
+def _assert_remote_url_allowed(url: str, allow_remote: bool) -> None:
     parsed = urlparse(url)
-    if parsed.scheme in {"http", "https"}:
-        if not allow_remote:
-            raise HTTPException(status_code=400, detail="Recursos remotos (http/https) no permitidos")
+    if parsed.scheme not in {"http", "https"}:
+        return
 
-        if parsed.scheme != "https":
-            raise HTTPException(status_code=400, detail="Solo se permiten recursos remotos HTTPS")
+    if not allow_remote:
+        raise HTTPException(status_code=400, detail="Recursos remotos (http/https) no permitidos")
 
-        host = (parsed.hostname or "").strip().lower()
-        if not host:
-            raise HTTPException(status_code=400, detail="Host remoto inválido")
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=400, detail="Solo se permiten recursos remotos HTTPS")
 
-        if REMOTE_ALLOWED_HOSTS and host not in REMOTE_ALLOWED_HOSTS:
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise HTTPException(status_code=400, detail="Host remoto inválido")
+
+    if REMOTE_ALLOWED_HOSTS and host not in REMOTE_ALLOWED_HOSTS:
+        raise HTTPException(status_code=400, detail="Host remoto no permitido")
+
+    if host in {"localhost"}:
+        raise HTTPException(status_code=400, detail="Host remoto no permitido")
+
+    try:
+        ipaddress.ip_address(host)
+        if _is_forbidden_ip(host):
             raise HTTPException(status_code=400, detail="Host remoto no permitido")
-
-        if host in {"localhost"}:
+    except ValueError:
+        if _hostname_resolves_to_forbidden_ip(host):
             raise HTTPException(status_code=400, detail="Host remoto no permitido")
-
-        try:
-            ipaddress.ip_address(host)
-            if _is_forbidden_ip(host):
-                raise HTTPException(status_code=400, detail="Host remoto no permitido")
-        except ValueError:
-            if _hostname_resolves_to_forbidden_ip(host):
-                raise HTTPException(status_code=400, detail="Host remoto no permitido")
-
-    return default_url_fetcher(url)
 
 
 def _normalize_html_input(html: str) -> str:
@@ -226,33 +269,359 @@ def _normalize_html_input(html: str) -> str:
     return normalized
 
 
-def _render_pdf(
-    *,
+def _inject_base_href(html: str, base_url: str | None) -> str:
+    if not base_url:
+        return html
+
+    lowered = html.lower()
+    if "<base" in lowered:
+        return html
+
+    tag = f'<base href="{base_url}">'
+    head_idx = lowered.find("<head")
+    if head_idx != -1:
+        head_close = lowered.find(">", head_idx)
+        if head_close != -1:
+            return html[: head_close + 1] + tag + html[head_close + 1 :]
+
+    html_idx = lowered.find("<html")
+    if html_idx != -1:
+        html_close = lowered.find(">", html_idx)
+        if html_close != -1:
+            return html[: html_close + 1] + f"<head>{tag}</head>" + html[html_close + 1 :]
+
+    return f"<head>{tag}</head>" + html
+
+
+def _render_pdf_chromium(
     html: str,
     base_url: str | None,
     allow_remote: bool,
+    media: str,
 ) -> bytes:
-    return HTML(
-        string=html,
-        base_url=base_url,
-        url_fetcher=lambda url: _safe_url_fetcher(url, allow_remote=allow_remote),
-    ).write_pdf()
+    normalized_html = _inject_base_href(html, base_url)
+    t0 = time.perf_counter()
+
+    _logger.info(
+        json.dumps(
+            {
+                "event": "render_pdf_chromium_stage",
+                "stage": "get_browser",
+                "media": media,
+                "allow_remote": allow_remote,
+            }
+        )
+    )
+    if sync_playwright is None:
+        raise HTTPException(status_code=500, detail="Chromium no disponible (Playwright no instalado)")
+
+    def _route_handler(route, request):
+        url = request.url
+        parsed = urlparse(url)
+
+        if parsed.scheme in {"http", "https"}:
+            try:
+                _assert_remote_url_allowed(url, allow_remote=allow_remote)
+            except HTTPException:
+                _logger.info(
+                    json.dumps(
+                        {
+                            "event": "render_pdf_chromium_resource_blocked",
+                            "media": media,
+                            "allow_remote": allow_remote,
+                            "url": url,
+                        }
+                    )
+                )
+                route.abort()
+                return
+            route.continue_()
+            return
+
+        if parsed.scheme in {"file", "data", "blob", "about"}:
+            route.continue_()
+            return
+
+        route.abort()
+
+    t_pw0 = time.perf_counter()
+    _logger.info(
+        json.dumps(
+            {
+                "event": "render_pdf_chromium_stage",
+                "stage": "playwright_start",
+                "media": media,
+                "allow_remote": allow_remote,
+            }
+        )
+    )
+
+    old_policy = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _logger.info(
+        json.dumps(
+            {
+                "event": "render_pdf_chromium_stage",
+                "stage": "asyncio_policy_ready",
+                "media": media,
+                "allow_remote": allow_remote,
+                "policy": old_policy.__class__.__name__,
+            }
+        )
+    )
+
+    try:
+        with sync_playwright() as p:
+            t_pw1 = time.perf_counter()
+            _logger.info(
+                json.dumps(
+                    {
+                        "event": "render_pdf_chromium_stage",
+                        "stage": "playwright_ready",
+                        "media": media,
+                        "allow_remote": allow_remote,
+                        "ms": int((t_pw1 - t_pw0) * 1000),
+                    }
+                )
+            )
+
+            t_launch0 = time.perf_counter()
+            _logger.info(
+                json.dumps(
+                    {
+                        "event": "render_pdf_chromium_stage",
+                        "stage": "browser_launch_start",
+                        "media": media,
+                        "allow_remote": allow_remote,
+                    }
+                )
+            )
+
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+
+            t_launch1 = time.perf_counter()
+            _logger.info(
+                json.dumps(
+                    {
+                        "event": "render_pdf_chromium_stage",
+                        "stage": "browser_launch_ready",
+                        "media": media,
+                        "allow_remote": allow_remote,
+                        "ms": int((t_launch1 - t_launch0) * 1000),
+                    }
+                )
+            )
+
+            page = None
+            try:
+                _logger.info(
+                    json.dumps(
+                        {
+                            "event": "render_pdf_chromium_stage",
+                            "stage": "new_page",
+                            "media": media,
+                            "allow_remote": allow_remote,
+                        }
+                    )
+                )
+
+                page = browser.new_page(viewport={"width": PDF_VIEWPORT_WIDTH, "height": PDF_VIEWPORT_HEIGHT})
+                page.route("**/*", _route_handler)
+                page.on(
+                    "requestfailed",
+                    lambda req: _logger.info(
+                        json.dumps(
+                            {
+                                "event": "render_pdf_chromium_request_failed",
+                                "media": media,
+                                "allow_remote": allow_remote,
+                                "url": req.url,
+                                "failure": (req.failure or {}).get("errorText"),
+                            }
+                        )
+                    ),
+                )
+                if media in {"screen", "print"}:
+                    page.emulate_media(media=media)
+
+                t_set_content0 = time.perf_counter()
+                page.set_content(
+                    normalized_html,
+                    wait_until="domcontentloaded",
+                    timeout=int(RENDER_TIMEOUT_SECONDS * 1000),
+                )
+
+                t_after_content = time.perf_counter()
+                _logger.info(
+                    json.dumps(
+                        {
+                            "event": "render_pdf_chromium_stage",
+                            "stage": "content_set",
+                            "media": media,
+                            "allow_remote": allow_remote,
+                            "ms": int((t_after_content - t_set_content0) * 1000),
+                        }
+                    )
+                )
+                try:
+                    page.wait_for_load_state("load", timeout=2000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=2000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_function(
+                        "document.fonts && document.fonts.status === 'loaded'",
+                        timeout=2000,
+                    )
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_function(
+                        "Array.from(document.images || []).every(i => i.complete)",
+                        timeout=5000,
+                    )
+                except Exception:
+                    pass
+                page.wait_for_timeout(100)
+
+                t_ready = time.perf_counter()
+                _logger.info(
+                    json.dumps(
+                        {
+                            "event": "render_pdf_chromium_stage",
+                            "stage": "ready",
+                            "media": media,
+                            "allow_remote": allow_remote,
+                            "ms": int((t_ready - t_after_content) * 1000),
+                        }
+                    )
+                )
+
+                pdf_options: dict[str, object] = {
+                    "print_background": True,
+                    "prefer_css_page_size": True,
+                    "margin": {"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                    "scale": 1,
+                }
+
+                if media == "screen":
+                    if PDF_SCREEN_SINGLE_PAGE or PDF_OUTPUT_WIDTH or PDF_OUTPUT_HEIGHT:
+                        out_w = (PDF_OUTPUT_WIDTH or f"{PDF_VIEWPORT_WIDTH}px").strip()
+                        if PDF_OUTPUT_HEIGHT:
+                            out_h = PDF_OUTPUT_HEIGHT.strip()
+                        else:
+                            scroll_h = page.evaluate(
+                                "Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+                            )
+                            try:
+                                scroll_h_int = int(scroll_h)
+                            except Exception:
+                                scroll_h_int = PDF_VIEWPORT_HEIGHT
+                            height_px = max(scroll_h_int, PDF_VIEWPORT_HEIGHT)
+                            if PDF_MAX_HEIGHT_PX > 0:
+                                height_px = min(height_px, PDF_MAX_HEIGHT_PX)
+                            out_h = f"{height_px}px"
+                        pdf_options["width"] = out_w
+                        pdf_options["height"] = out_h
+                        pdf_options["prefer_css_page_size"] = False
+                    else:
+                        # Mantener el layout "screen" (sin reflow) pero paginar:
+                        # usa el mismo ancho del viewport y un alto fijo tipo hoja.
+                        # (A4 aprox. a 96dpi => 1123px) para evitar saltos raros con secciones 100vh.
+                        pdf_options["width"] = (PDF_OUTPUT_WIDTH or f"{PDF_VIEWPORT_WIDTH}px").strip()
+                        pdf_options["height"] = (PDF_OUTPUT_HEIGHT or "1123px").strip()
+                        pdf_options["prefer_css_page_size"] = False
+
+                t_pdf0 = time.perf_counter()
+                _logger.info(
+                    json.dumps(
+                        {
+                            "event": "render_pdf_chromium_stage",
+                            "stage": "pdf_start",
+                            "media": media,
+                            "allow_remote": allow_remote,
+                        }
+                    )
+                )
+
+                pdf = page.pdf(**pdf_options)
+                t_pdf1 = time.perf_counter()
+                _logger.info(
+                    json.dumps(
+                        {
+                            "event": "render_pdf_chromium",
+                            "media": media,
+                            "allow_remote": allow_remote,
+                            "ms_set_content": int((t_after_content - t_set_content0) * 1000),
+                            "ms_ready": int((t_ready - t_after_content) * 1000),
+                            "ms_pdf": int((t_pdf1 - t_pdf0) * 1000),
+                            "ms_total": int((t_pdf1 - t0) * 1000),
+                        }
+                    )
+                )
+                return pdf
+            finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+        asyncio.set_event_loop_policy(old_policy)
+
+
+@app.on_event("shutdown")
+def _shutdown_playwright():
+    global _playwright, _chromium_browser
+    with _chromium_lock:
+        if _chromium_browser is not None:
+            try:
+                _chromium_browser.close()
+            except Exception:
+                pass
+            _chromium_browser = None
+        if _playwright is not None:
+            try:
+                _playwright.stop()
+            except Exception:
+                pass
+            _playwright = None
 
 
 def _render_pdf_with_timeout(
-    *,
     html: str,
     base_url: str | None,
     allow_remote: bool,
+    media: str,
 ) -> bytes:
     future = _executor.submit(
-        _render_pdf,
+        _render_pdf_chromium,
         html=html,
         base_url=base_url,
         allow_remote=allow_remote,
+        media=media,
     )
     try:
-        return future.result(timeout=RENDER_TIMEOUT_SECONDS)
+        return future.result(timeout=RENDER_TIMEOUT_SECONDS + 15.0)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Timeout generando PDF") from exc
 
@@ -261,6 +630,11 @@ class PdfRequest(BaseModel):
     html: str
     filename: str | None = "documento.pdf"
     base_url: str | None = None
+    media: str | None = None
+
+
+def _default_media() -> str:
+    return "screen"
 
 
 @app.get("/health")
@@ -270,24 +644,17 @@ def health():
 
 @app.get("/version")
 def version():
-    try:
-        import weasyprint
-        weasyprint_version = getattr(weasyprint, "__version__", "unknown")
-    except Exception:
-        weasyprint_version = "unknown"
-
-    try:
-        import pydyf
-        pydyf_version = getattr(pydyf, "__version__", "unknown")
-    except Exception:
-        pydyf_version = "unknown"
-
     return {
         "service": "html-to-pdf-api",
-        "weasyprint": weasyprint_version,
-        "pydyf": pydyf_version,
+        "playwright_available": sync_playwright is not None,
         "max_html_bytes": MAX_HTML_BYTES,
         "render_timeout_seconds": RENDER_TIMEOUT_SECONDS,
+        "pdf_viewport_width": PDF_VIEWPORT_WIDTH,
+        "pdf_viewport_height": PDF_VIEWPORT_HEIGHT,
+        "pdf_output_width": PDF_OUTPUT_WIDTH,
+        "pdf_output_height": PDF_OUTPUT_HEIGHT,
+        "pdf_max_height_px": PDF_MAX_HEIGHT_PX,
+        "pdf_screen_single_page": PDF_SCREEN_SINGLE_PAGE,
         "rate_limit_normal_per_min": RATE_LIMIT_NORMAL_PER_MIN,
         "rate_limit_remote_per_min": RATE_LIMIT_REMOTE_PER_MIN,
         "jobs_ttl_seconds": JOBS_TTL_SECONDS,
@@ -330,12 +697,17 @@ def create_pdf(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
     html = _normalize_html_input(payload.html)
     _enforce_size_limit(html)
 
+    media = (payload.media or _default_media()).strip().lower()
+    if media not in {"print", "screen"}:
+        raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
+
     try:
         started = time.time()
         pdf_bytes = _render_pdf_with_timeout(
             html=html,
             base_url=payload.base_url,
             allow_remote=auth.allow_remote,
+            media=media,
         )
         elapsed_ms = int((time.time() - started) * 1000)
         _logger.info(
@@ -371,6 +743,7 @@ def create_pdf_raw(
     html: str = Body(..., media_type="text/html"),
     filename: str | None = Query("documento.pdf"),
     base_url: str | None = Query(None),
+    media: str | None = Query(None),
     auth: _AuthContext = Depends(_require_api_key),
 ):
     if not html or not html.strip():
@@ -379,12 +752,17 @@ def create_pdf_raw(
     normalized_html = _normalize_html_input(html)
     _enforce_size_limit(normalized_html)
 
+    media_normalized = (media or _default_media()).strip().lower()
+    if media_normalized not in {"print", "screen"}:
+        raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
+
     try:
         started = time.time()
         pdf_bytes = _render_pdf_with_timeout(
             html=normalized_html,
             base_url=base_url,
             allow_remote=auth.allow_remote,
+            media=media_normalized,
         )
         elapsed_ms = int((time.time() - started) * 1000)
         _logger.info(
@@ -416,6 +794,10 @@ def create_job(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
     html = _normalize_html_input(payload.html)
     _enforce_size_limit(html)
 
+    media = (payload.media or _default_media()).strip().lower()
+    if media not in {"print", "screen"}:
+        raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
+
     job_id = str(uuid.uuid4())
     job = _Job(job_id)
     _jobs[job_id] = job
@@ -427,6 +809,7 @@ def create_job(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
             html=html,
             base_url=payload.base_url,
             allow_remote=auth.allow_remote,
+            media=media,
         )
         return result
 
@@ -477,6 +860,7 @@ async def create_pdf_upload(
     html: str = Form(...),
     files: list[UploadFile] = File(default=[]),
     filename: str | None = Query("documento.pdf"),
+    media: str | None = Query(None),
     auth: _AuthContext = Depends(_require_api_key),
 ):
     if not html or not html.strip():
@@ -484,6 +868,10 @@ async def create_pdf_upload(
 
     normalized_html = _normalize_html_input(html)
     _enforce_size_limit(normalized_html)
+
+    media_normalized = (media or _default_media()).strip().lower()
+    if media_normalized not in {"print", "screen"}:
+        raise HTTPException(status_code=400, detail="media inválido (usa 'print' o 'screen')")
 
     safe_filename = filename or "documento.pdf"
 
@@ -504,6 +892,7 @@ async def create_pdf_upload(
                 html=normalized_html,
                 base_url=base_path.as_uri() + "/",
                 allow_remote=auth.allow_remote,
+                media=media_normalized,
             )
             elapsed_ms = int((time.time() - started) * 1000)
             _logger.info(

@@ -133,6 +133,15 @@ docker compose --profile prod up -d --build
   - `RATE_LIMIT_NORMAL_PER_MIN`
   - `RATE_LIMIT_REMOTE_PER_MIN`
 
+## Motor de render (idéntico al navegador)
+
+La API genera PDF usando **Chromium (Playwright)** para obtener un render lo más parecido posible a Chrome/Edge.
+
+Variables útiles:
+
+- `PDF_VIEWPORT_WIDTH` / `PDF_VIEWPORT_HEIGHT`: viewport usado para renderizar (impacta layout responsive).
+- `PDF_OUTPUT_WIDTH` / `PDF_OUTPUT_HEIGHT`: tamaño de salida del PDF en px. Si `PDF_OUTPUT_HEIGHT` está vacío, se usa el alto real del documento (scrollHeight) para evitar paginación.
+
 ## Autenticación (tokens)
 
 Los devs NO deben hardcodear tokens en el código. Se configuran por ambiente en `.env`:
