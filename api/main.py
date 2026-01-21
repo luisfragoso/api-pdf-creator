@@ -48,6 +48,7 @@ PDF_OUTPUT_WIDTH = os.getenv("PDF_OUTPUT_WIDTH", "")
 PDF_OUTPUT_HEIGHT = os.getenv("PDF_OUTPUT_HEIGHT", "")
 PDF_MAX_HEIGHT_PX = int(os.getenv("PDF_MAX_HEIGHT_PX", "20000"))
 PDF_SCREEN_SINGLE_PAGE = os.getenv("PDF_SCREEN_SINGLE_PAGE", "").strip().lower() in {"1", "true", "yes"}
+AUTO_PRINT_ON_PAGE_SIZE = os.getenv("AUTO_PRINT_ON_PAGE_SIZE", "1").strip().lower() in {"1", "true", "yes"}
 
 RATE_LIMIT_NORMAL_PER_MIN = int(os.getenv("RATE_LIMIT_NORMAL_PER_MIN", "60"))
 RATE_LIMIT_REMOTE_PER_MIN = int(os.getenv("RATE_LIMIT_REMOTE_PER_MIN", "20"))
@@ -366,9 +367,7 @@ def _validate_base_url(
     parsed = urlparse(base_url)
 
     if parsed.scheme == "file":
-        if not allow_file_access:
-            raise HTTPException(status_code=400, detail="base_url file:// no permitido")
-        if not ALLOW_FILE_SCHEME:
+        if not allow_file_access or not ALLOW_FILE_SCHEME:
             raise HTTPException(status_code=400, detail="base_url file:// no permitido")
         if not file_root:
             raise HTTPException(status_code=400, detail="base_url file:// no permitido")
@@ -1263,6 +1262,7 @@ def version():
         "pdf_output_height": PDF_OUTPUT_HEIGHT,
         "pdf_max_height_px": PDF_MAX_HEIGHT_PX,
         "pdf_screen_single_page": PDF_SCREEN_SINGLE_PAGE,
+        "auto_print_on_page_size": AUTO_PRINT_ON_PAGE_SIZE,
         "rate_limit_normal_per_min": RATE_LIMIT_NORMAL_PER_MIN,
         "rate_limit_remote_per_min": RATE_LIMIT_REMOTE_PER_MIN,
         "jobs_ttl_seconds": JOBS_TTL_SECONDS,
@@ -1305,7 +1305,7 @@ def create_pdf(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
     html = _normalize_html_input(payload.html)
     _enforce_size_limit(html)
 
-    if payload.media is None and _html_defines_page_size(html):
+    if payload.media is None and AUTO_PRINT_ON_PAGE_SIZE and _html_defines_page_size(html):
         media = "print"
     else:
         media = (payload.media or _default_media()).strip().lower()
@@ -1393,7 +1393,7 @@ def create_pdf_raw(
     normalized_html = _normalize_html_input(html)
     _enforce_size_limit(normalized_html)
 
-    if media is None and _html_defines_page_size(normalized_html):
+    if media is None and AUTO_PRINT_ON_PAGE_SIZE and _html_defines_page_size(normalized_html):
         media_normalized = "print"
     else:
         media_normalized = (media or _default_media()).strip().lower()
@@ -1461,7 +1461,7 @@ def create_job(payload: PdfRequest, auth: _AuthContext = Depends(_require_api_ke
     html = _normalize_html_input(payload.html)
     _enforce_size_limit(html)
 
-    if payload.media is None and _html_defines_page_size(html):
+    if payload.media is None and AUTO_PRINT_ON_PAGE_SIZE and _html_defines_page_size(html):
         media = "print"
     else:
         media = (payload.media or _default_media()).strip().lower()
@@ -1563,7 +1563,7 @@ async def create_pdf_upload(
     normalized_html = _normalize_html_input(html)
     _enforce_size_limit(normalized_html)
 
-    if media is None and _html_defines_page_size(normalized_html):
+    if media is None and AUTO_PRINT_ON_PAGE_SIZE and _html_defines_page_size(normalized_html):
         media_normalized = "print"
     else:
         media_normalized = (media or _default_media()).strip().lower()
